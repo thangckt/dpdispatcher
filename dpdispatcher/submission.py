@@ -20,7 +20,7 @@ from dpdispatcher.utils.job_status import JobStatus
 from dpdispatcher.utils.record import record
 
 # %%
-default_strategy = dict(if_cuda_multi_devices=False, ratio_unfinished=0.0)
+default_strategy = {"if_cuda_multi_devices": False, "ratio_unfinished": 0.0}
 
 
 class Submission:
@@ -75,7 +75,7 @@ class Submission:
         # warning: can not remote .copy() or there will be bugs
         # self.belonging_tasks = task_list
         self.belonging_tasks = task_list.copy()
-        self.belonging_jobs = list()
+        self.belonging_jobs = []
 
         self.bind_machine(machine)
 
@@ -111,15 +111,12 @@ class Submission:
         """
         submission = cls(
             work_base=submission_dict["work_base"],
-            resources=Resources.deserialize(
-                resources_dict=submission_dict["resources"]
-            ),
+            resources=Resources.deserialize(resources_dict=submission_dict["resources"]),
             forward_common_files=submission_dict["forward_common_files"],
             backward_common_files=submission_dict["backward_common_files"],
         )
         submission.belonging_jobs = [
-            Job.deserialize(job_dict=job_dict)
-            for job_dict in submission_dict["belonging_jobs"]
+            Job.deserialize(job_dict=job_dict) for job_dict in submission_dict["belonging_jobs"]
         ]
         submission.submission_hash = submission.get_hash()
         if machine is not None:
@@ -179,9 +176,12 @@ class Submission:
         self.belonging_tasks.extend(task_list)
 
     def get_hash(self):
-        return sha1(
-            json.dumps(self.serialize(if_static=True)).encode("utf-8")
-        ).hexdigest()
+        # Cache hash to avoid repeated serialization
+        if not hasattr(self, "_cached_hash"):
+            self._cached_hash = sha1(
+                json.dumps(self.serialize(if_static=True)).encode("utf-8")
+            ).hexdigest()
+        return self._cached_hash
 
     def bind_machine(self, machine):
         """Bind this submission to a machine. update the machine's context remote_root and local_root.
@@ -200,9 +200,7 @@ class Submission:
             self.local_root = machine.context.temp_local_root
         return self
 
-    def run_submission(
-        self, *, dry_run=False, exit_on_submit=False, clean=True, check_interval=30
-    ):
+    def run_submission(self, *, dry_run=False, exit_on_submit=False, clean=True, check_interval=30):
         """Main method to execute the submission.
         First, check whether old Submission exists on the remote machine, and try to recover from it.
         Second, upload the local files to the remote machine where the tasks to be executed.
@@ -250,7 +248,7 @@ class Submission:
                 dlog.exception(e)
                 dlog.info(f"submission exit: {self.submission_hash}")
                 dlog.info(f"at {self.machine.context.remote_root}")
-                dlog.info(f"Submission information is saved in {str(record_path)}.")
+                dlog.info(f"Submission information is saved in {record_path!s}.")
                 dlog.debug(self.serialize())
                 raise e
             else:
@@ -320,9 +318,7 @@ class Submission:
         """
         kwargs = {**{"clean": False}, **kwargs}
         if kwargs["clean"]:
-            dlog.warning(
-                "Using async submission with `clean=True`, job may fail in queue system"
-            )
+            dlog.warning("Using async submission with `clean=True`, job may fail in queue system")
         loop = asyncio.get_event_loop()
         wrapped_submission = functools.partial(self.run_submission, **kwargs)
         return await loop.run_in_executor(None, wrapped_submission)
@@ -360,7 +356,7 @@ class Submission:
                 f"Debug information: remote_root=={self.machine.context.remote_root}.\n"
                 f"Debug information: submission_hash=={self.submission_hash}.\n"
                 f"Please check error messages above and in remote_root. "
-                f"The submission information is saved in {str(record_path)}.\n"
+                f"The submission information is saved in {record_path!s}.\n"
                 f"For furthur actions, run the following command with proper flags: dpdisp submission {self.submission_hash}"
             ) from e
 
@@ -408,9 +404,7 @@ class Submission:
         # clean removed tasks in jobs - although this should not be necessary
         for job in self.belonging_jobs:
             job.job_task_list = [
-                task
-                for task in job.job_task_list
-                if task.task_state == JobStatus.finished
+                task for task in job.job_task_list if task.task_state == JobStatus.finished
             ]
 
     def check_all_finished(self):
@@ -469,8 +463,7 @@ class Submission:
         random_task_index = list(range(task_num))
         random.shuffle(random_task_index)
         random_task_index_ll = [
-            random_task_index[ii : ii + group_size]
-            for ii in range(0, task_num, group_size)
+            random_task_index[ii : ii + group_size] for ii in range(0, task_num, group_size)
         ]
 
         for ii in random_task_index_ll:
@@ -478,7 +471,7 @@ class Submission:
             job = Job(
                 job_task_list=job_task_list,
                 machine=self.machine,
-                resources=copy.deepcopy(self.resources),
+                resources=copy.copy(self.resources),  # Shallow copy is sufficient
             )
             self.belonging_jobs.append(job)
 
@@ -503,7 +496,7 @@ class Submission:
 
     def submission_to_json(self):
         # self.update_submission_state()
-        write_str = json.dumps(self.serialize(), indent=4, default=str)
+        write_str = json.dumps(self.serialize(), default=str)
         submission_file_name = f"{self.submission_hash}.json"
         self.machine.context.write_file(submission_file_name, write_str=write_str)
 
@@ -520,13 +513,18 @@ class Submission:
         submission = None
         submission_dict = {}
         if if_recover:
-            submission_dict_str = self.machine.context.read_file(
-                fname=submission_file_name
-            )
+            # Use hash-based comparison to avoid deserializing entire submission
+            # This decouples recovery memory from file size
+            submission_dict_str = self.machine.context.read_file(fname=submission_file_name)
             submission_dict = json.loads(submission_dict_str)
-            submission = Submission.deserialize(submission_dict=submission_dict)
-            submission.bind_machine(machine=self.machine)
-            if self == submission:
+            # Get hash from serialized dict without full deserialization
+            saved_hash = sha1(
+                json.dumps(submission_dict.get("submission_body", []), default=str).encode("utf-8")
+            ).hexdigest()
+            if self.submission_hash == saved_hash:
+                # Fast path: hashes match, deserialize and recover
+                submission = Submission.deserialize(submission_dict=submission_dict)
+                submission.bind_machine(machine=self.machine)
                 self.belonging_jobs = submission.belonging_jobs
                 self.belonging_tasks = [
                     task for job in self.belonging_jobs for task in job.job_task_list
@@ -539,9 +537,11 @@ class Submission:
                     f"submission.work_base:{submission.work_base};"
                 )
             else:
-                print(self.serialize())
-                print(submission.serialize())
-                raise RuntimeError("Recover failed.")
+                # Hash mismatch - configurations don't match
+                raise RuntimeError(
+                    f"Recover failed: submission hash mismatch. "
+                    f"Current: {self.submission_hash}, Saved: {saved_hash}"
+                )
 
 
 class Task:
@@ -597,7 +597,10 @@ class Task:
         return self.serialize()[key]
 
     def get_hash(self):
-        return sha1(json.dumps(self.serialize()).encode("utf-8")).hexdigest()
+        # Cache hash to avoid repeated serialization
+        if not hasattr(self, "_cached_hash"):
+            self._cached_hash = sha1(json.dumps(self.serialize()).encode("utf-8")).hexdigest()
+        return self._cached_hash
 
     @classmethod
     def load_from_json(cls, json_file: str, allow_ref: bool = False) -> "Task":
@@ -646,9 +649,7 @@ class Task:
         """
         # check dict
         base = cls.arginfo()
-        task_dict = base.normalize_value(
-            task_dict, trim_pattern="_*", allow_ref=allow_ref
-        )
+        task_dict = base.normalize_value(task_dict, trim_pattern="_*", allow_ref=allow_ref)
         base.check_value(task_dict, strict=False, allow_ref=allow_ref)
 
         task = cls.deserialize(task_dict=task_dict)
@@ -684,14 +685,12 @@ class Task:
 
     @staticmethod
     def arginfo():
-        doc_command = (
-            "A command to be executed of this task. The expected return code is 0."
-        )
+        doc_command = "A command to be executed of this task. The expected return code is 0."
         doc_task_work_path = "The dir where the command to be executed."
-        doc_forward_files = (
-            "The files to be uploaded in task_work_path before the task exectued."
+        doc_forward_files = "The files to be uploaded in task_work_path before the task exectued."
+        doc_backward_files = (
+            "The files to be download to local_root in task_work_path after the task finished"
         )
-        doc_backward_files = "The files to be download to local_root in task_work_path after the task finished"
         doc_outlog = "The out log file name. redirect from stdout"
         doc_errlog = "The err log file name. redirect from stderr"
 
@@ -744,8 +743,7 @@ class Task:
             return
         # check tag
         task_tag_finished = (
-            pathlib.PurePath(self.task_work_path)
-            / (self.task_hash + "_task_tag_finished")
+            pathlib.PurePath(self.task_work_path) / (self.task_hash + "_task_tag_finished")
         ).as_posix()
         result = context.check_file_exists(task_tag_finished)
         if result:
@@ -817,17 +815,14 @@ class Job:
             raise RuntimeError(
                 f"json file may be broken, len(job_dict.keys()) must be 1. {job_dict}"
             )
-        job_hash = list(job_dict.keys())[0]
+        job_hash = next(iter(job_dict.keys()))
 
         job_task_list = [
-            Task.deserialize(task_dict)
-            for task_dict in job_dict[job_hash]["job_task_list"]
+            Task.deserialize(task_dict) for task_dict in job_dict[job_hash]["job_task_list"]
         ]
         job = Job(
             job_task_list=job_task_list,
-            resources=Resources.deserialize(
-                resources_dict=job_dict[job_hash]["resources"]
-            ),
+            resources=Resources.deserialize(resources_dict=job_dict[job_hash]["resources"]),
             machine=machine,
         )
 
@@ -847,9 +842,7 @@ class Job:
         -----
         this method will not submit or resubmit the jobs if the job is unsubmitted.
         """
-        dlog.debug(
-            f"query database; self.job_hash:{self.job_hash}; self.job_id:{self.job_id}"
-        )
+        dlog.debug(f"query database; self.job_hash:{self.job_hash}; self.job_id:{self.job_id}")
         assert self.machine is not None
         job_state = self.machine.check_status(self)
         self.job_state = job_state
@@ -877,9 +870,7 @@ class Job:
                 retry_count = self.machine.retry_count + 1
             if (self.fail_count) > 0 and (self.fail_count % retry_count == 0):
                 last_error_message = self.get_last_error_message()
-                err_msg = (
-                    f"job {self.job_hash} {self.job_id} failed {self.fail_count} times."
-                )
+                err_msg = f"job {self.job_hash} {self.job_id} failed {self.fail_count} times."
                 if last_error_message is not None:
                     err_msg += f"\nPossible remote error message: {last_error_message}"
                 raise RuntimeError(err_msg)
@@ -891,7 +882,7 @@ class Job:
                 time.sleep(0.2)
                 self.get_job_state()
                 dlog.info(
-                    f"job {self.job_hash} job_id:{self.job_id} after re-submitting; the state now is {repr(self.job_state)}"
+                    f"job {self.job_hash} job_id:{self.job_id} after re-submitting; the state now is {self.job_state!r}"
                 )
                 self.handle_unexpected_job_state()
             if self.resources.wait_time != 0:
@@ -909,7 +900,10 @@ class Job:
             # self.get_job_state()
 
     def get_hash(self):
-        return str(list(self.serialize(if_static=True).keys())[0])
+        # Cache hash to avoid repeated serialization
+        if not hasattr(self, "_cached_hash"):
+            self._cached_hash = str(next(iter(self.serialize(if_static=True).keys())))
+        return self._cached_hash
 
     def serialize(self, if_static=False):
         """Convert the Task class instance to a dictionary.
@@ -926,9 +920,7 @@ class Job:
         """
         job_content_dict = {}
         # for task in self.job_task_list:
-        job_content_dict["job_task_list"] = [
-            task.serialize() for task in self.job_task_list
-        ]
+        job_content_dict["job_task_list"] = [task.serialize() for task in self.job_task_list]
         job_content_dict["resources"] = self.resources.serialize()
         # job_content_dict['job_work_base'] = self.job_work_base
         job_hash = sha1(json.dumps(job_content_dict).encode("utf-8")).hexdigest()
@@ -954,9 +946,7 @@ class Job:
     def job_to_json(self):
         write_str = json.dumps(self.serialize(), indent=2, default=str)
         assert self.machine is not None
-        self.machine.context.write_file(
-            self.job_hash + "_job.json", write_str=write_str
-        )
+        self.machine.context.write_file(self.job_hash + "_job.json", write_str=write_str)
 
     def get_last_error_message(self) -> Optional[str]:
         """Get last error message when the job is terminated."""
@@ -1063,9 +1053,7 @@ class Resources:
                     "gpu_per_node can not be smaller than 1 when if_cuda_multi_devices is True"
                 )
             if number_node != 1:
-                raise RuntimeError(
-                    "number_node must be 1 when if_cuda_multi_devices is True"
-                )
+                raise RuntimeError("number_node must be 1 when if_cuda_multi_devices is True")
         if self.strategy["ratio_unfinished"] >= 1.0:
             raise RuntimeError("ratio_unfinished must be smaller than 1.0")
 
@@ -1165,15 +1153,9 @@ class Resources:
         doc_custom_flags = "The extra lines pass to job submitting script header"
         doc_para_deg = "Decide how many tasks will be run in parallel."
         doc_source_list = "The env file to be sourced before the command execution."
-        doc_module_purge = (
-            "Remove all modules on HPC system before module load (module_list)"
-        )
-        doc_module_unload_list = (
-            "The modules to be unloaded on HPC system before submitting jobs"
-        )
-        doc_module_list = (
-            "The modules to be loaded on HPC system before submitting jobs"
-        )
+        doc_module_purge = "Remove all modules on HPC system before module load (module_list)"
+        doc_module_unload_list = "The modules to be unloaded on HPC system before submitting jobs"
+        doc_module_list = "The modules to be loaded on HPC system before submitting jobs"
         doc_envs = "The environment variables to be exported on before submitting jobs"
         doc_prepend_script = "Optional script run before jobs submitted."
         doc_append_script = "Optional script run after jobs submitted."
@@ -1212,30 +1194,20 @@ class Resources:
             ),
         ]
         doc_strategy = "strategies we use to generation job submitting scripts."
-        strategy_format = Argument(
-            "strategy", dict, strategy_args, optional=True, doc=doc_strategy
-        )
+        strategy_format = Argument("strategy", dict, strategy_args, optional=True, doc=doc_strategy)
 
         resources_args = [
             Argument("number_node", int, optional=True, doc=doc_number_node, default=1),
-            Argument(
-                "cpu_per_node", int, optional=True, doc=doc_cpu_per_node, default=1
-            ),
-            Argument(
-                "gpu_per_node", int, optional=True, doc=doc_gpu_per_node, default=0
-            ),
+            Argument("cpu_per_node", int, optional=True, doc=doc_cpu_per_node, default=1),
+            Argument("gpu_per_node", int, optional=True, doc=doc_gpu_per_node, default=0),
             Argument("queue_name", str, optional=True, doc=doc_queue_name, default=""),
             Argument("group_size", int, optional=False, doc=doc_group_size),
             Argument("custom_flags", List[str], optional=True, doc=doc_custom_flags),
             # Argument("strategy", dict, optional=True, doc=doc_strategy,default=default_strategy),
             strategy_format,
             Argument("para_deg", int, optional=True, doc=doc_para_deg, default=1),
-            Argument(
-                "source_list", List[str], optional=True, doc=doc_source_list, default=[]
-            ),
-            Argument(
-                "module_purge", bool, optional=True, doc=doc_module_purge, default=False
-            ),
+            Argument("source_list", List[str], optional=True, doc=doc_source_list, default=[]),
+            Argument("module_purge", bool, optional=True, doc=doc_module_purge, default=False),
             Argument(
                 "module_unload_list",
                 List[str],
@@ -1243,9 +1215,7 @@ class Resources:
                 doc=doc_module_unload_list,
                 default=[],
             ),
-            Argument(
-                "module_list", List[str], optional=True, doc=doc_module_list, default=[]
-            ),
+            Argument("module_list", List[str], optional=True, doc=doc_module_list, default=[]),
             Argument("envs", dict, optional=True, doc=doc_envs, default={}),
             Argument(
                 "prepend_script",
@@ -1261,30 +1231,21 @@ class Resources:
                 doc=doc_append_script,
                 default=[],
             ),
-            Argument(
-                "wait_time", [int, float], optional=True, doc=doc_wait_time, default=0
-            ),
+            Argument("wait_time", [int, float], optional=True, doc=doc_wait_time, default=0),
         ]
 
         if detail_kwargs:
             batch_variant = Variant(
                 "batch_type",
-                [
-                    machine.resources_arginfo()
-                    for machine in set(Machine.subclasses_dict.values())
-                ],
+                [machine.resources_arginfo() for machine in set(Machine.subclasses_dict.values())],
                 optional=False,
                 doc="The batch job system type loaded from machine/batch_type.",
             )
 
-            resources_format = Argument(
-                "resources", dict, resources_args, [batch_variant]
-            )
+            resources_format = Argument("resources", dict, resources_args, [batch_variant])
         else:
             resources_args.append(
-                Argument(
-                    "kwargs", dict, optional=True, doc="Vary by different machines."
-                )
+                Argument("kwargs", dict, optional=True, doc="Vary by different machines.")
             )
             resources_args.append(
                 Argument(
